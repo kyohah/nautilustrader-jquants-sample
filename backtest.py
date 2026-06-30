@@ -1,15 +1,19 @@
 """
 NautilusTrader × J-Quants バックテストサンプル
 
-BNF(小手川隆)スタイルの押し目買い戦略:
-  - 25日MA が上向き（上昇トレンド確認）
-  - 5日MA が 25日MA を下から上に抜けた（押し目からの回復）
-  - 終値が 25日MA を下割れしたら撤退
+BNF(小手川隆)スタイルの乖離率逆張り戦略:
+  エントリー条件（3つ複合）:
+    1. 25日MA からの下方乖離率 -20% 以上（BNF 本人発言）
+    2. 出来高が 20日平均の 3倍以上（セリクラ確認）
+    3. ボリンジャーバンド -2σ 以下
+
+  エグジット条件:
+    - 乖離率が -2% 以上（25日MA への回帰）
 
 Usage:
     cp .env.example .env  # 認証情報を設定
     uv run python backtest.py
-    uv run python backtest.py --code 9984 --start 2022-01-01 --end 2023-12-31
+    uv run python backtest.py --code 9984 --start 2020-01-01 --end 2024-12-31
 """
 
 from __future__ import annotations
@@ -101,32 +105,49 @@ def df_to_bars(df: pd.DataFrame, instrument: Equity, bar_type: BarType) -> list[
 
 # ── BNF スタイル戦略 ─────────────────────────────────────────────────────────
 
+import math
+
+
 class BNFStrategyConfig(StrategyConfig, frozen=True):
     instrument_id: InstrumentId
-    fast_period: int = 5
-    slow_period: int = 25
-    trade_size: int = 100  # 株数（1単元）
+    ma_period: int = 25           # 25日MA（BNF 本人発言）
+    entry_deviation: float = -20.0  # 乖離率エントリー閾値（%）
+    exit_deviation: float = -2.0    # 乖離率エグジット閾値（%、MAへの回帰）
+    bb_sigma: float = 2.0           # BB 倍率
+    volume_ratio: float = 3.0       # 出来高急増判定（N日平均の何倍）
+    volume_period: int = 20         # 出来高平均の算出期間
+    trade_size: int = 100           # 株数（1単元）
 
 
 class BNFStrategy(Strategy):
     """
-    BNF(小手川隆)スタイルの押し目買い戦略。
+    BNF(小手川隆)の乖離率逆張り戦略。
 
-    エントリー条件:
-      - 25日MA が上向き（直近1本より上）
-      - 5日MA が 25日MA を下から上に抜けた（ゴールデンクロス）
+    BNF 本人発言:
+      「25日移動平均線からのマイナス乖離が最低20%、
+        安心して買えるのは35%以上の乖離率という感じだった」
 
-    エグジット条件:
-      - 終値が 25日MA を下割れ
+    エントリー（3条件複合）:
+      1. 25日MA 乖離率 <= -20%
+      2. 出来高が 20日平均の 3倍以上（セリクラ確認）
+      3. ボリンジャーバンド -2σ 以下
+
+    エグジット:
+      乖離率 >= -2%（25日MA への回帰）
     """
 
     def __init__(self, config: BNFStrategyConfig) -> None:
         super().__init__(config)
         self.instrument_id = config.instrument_id
-        self.fast_period = config.fast_period
-        self.slow_period = config.slow_period
+        self.ma_period = config.ma_period
+        self.entry_deviation = config.entry_deviation
+        self.exit_deviation = config.exit_deviation
+        self.bb_sigma = config.bb_sigma
+        self.volume_ratio = config.volume_ratio
+        self.volume_period = config.volume_period
         self.trade_size = config.trade_size
         self._closes: list[float] = []
+        self._volumes: list[float] = []
 
     def on_start(self) -> None:
         self.instrument = self.cache.instrument(self.instrument_id)
@@ -138,31 +159,40 @@ class BNFStrategy(Strategy):
         self.subscribe_bars(bar_type)
 
     def on_bar(self, bar: Bar) -> None:
-        self._closes.append(float(bar.close))
-        needed = self.slow_period + 2
+        close = float(bar.close)
+        volume = float(bar.volume)
+        self._closes.append(close)
+        self._volumes.append(volume)
+
+        needed = max(self.ma_period, self.volume_period) + 1
         if len(self._closes) < needed:
             return
 
-        closes = self._closes
-        fast = self.fast_period
-        slow = self.slow_period
+        # MA は現在バーを除く直近 ma_period 本で計算（標準・デバッグスクリプトと一致）
+        ma25 = sum(self._closes[-self.ma_period - 1:-1]) / self.ma_period
+        deviation = (close - ma25) / ma25 * 100
 
-        fast_ma = sum(closes[-fast:]) / fast
-        slow_ma = sum(closes[-slow:]) / slow
-        fast_ma_prev = sum(closes[-fast - 1 : -1]) / fast
-        slow_ma_prev = sum(closes[-slow - 1 : -1]) / slow
+        # ボリンジャーバンド -Nσ（同じ window）
+        variance = sum((c - ma25) ** 2 for c in self._closes[-self.ma_period - 1:-1]) / self.ma_period
+        bb_lower = ma25 - self.bb_sigma * math.sqrt(variance)
+
+        # 出来高急増（現在バーを除く直近 volume_period 日平均）
+        avg_volume = sum(self._volumes[-self.volume_period - 1:-1]) / self.volume_period
+        volume_surge = avg_volume > 0 and volume >= avg_volume * self.volume_ratio
 
         has_position = bool(self.cache.positions_open(instrument_id=self.instrument_id))
 
-        slow_up = slow_ma > slow_ma_prev
-        golden_cross = fast_ma_prev <= slow_ma_prev and fast_ma > slow_ma
+        if not has_position:
+            if deviation <= self.entry_deviation and close <= bb_lower and volume_surge:
+                self._buy(deviation, bb_lower, volume / avg_volume if avg_volume > 0 else 0)
+        else:
+            if deviation >= self.exit_deviation:
+                self._sell(deviation)
 
-        if slow_up and golden_cross and not has_position:
-            self._buy()
-        elif float(bar.close) < slow_ma and has_position:
-            self._sell()
-
-    def _buy(self) -> None:
+    def _buy(self, deviation: float, bb_lower: float, vol_ratio: float) -> None:
+        self.log.info(
+            f"BUY  乖離率={deviation:.1f}%  BB-lower={bb_lower:.1f}  出来高比={vol_ratio:.1f}x"
+        )
         self.submit_order(
             self.order_factory.market(
                 instrument_id=self.instrument_id,
@@ -171,7 +201,8 @@ class BNFStrategy(Strategy):
             )
         )
 
-    def _sell(self) -> None:
+    def _sell(self, deviation: float) -> None:
+        self.log.info(f"SELL 乖離率={deviation:.1f}%（MA 回帰）")
         self.submit_order(
             self.order_factory.market(
                 instrument_id=self.instrument_id,
@@ -215,7 +246,15 @@ def run(code: str, start: str, end: str) -> None:
     )
     engine.add_instrument(instrument)
     engine.add_data(bars)
-    engine.add_strategy(BNFStrategy(BNFStrategyConfig(instrument_id=instrument.id)))
+    engine.add_strategy(
+        BNFStrategy(
+            BNFStrategyConfig(
+                instrument_id=instrument.id,
+                entry_deviation=-15.0,  # 原典は -20% だが現代相場では -15% が現実的
+                exit_deviation=-2.0,
+            )
+        )
+    )
     engine.run()
 
     print("\n=== 結果 ===")
