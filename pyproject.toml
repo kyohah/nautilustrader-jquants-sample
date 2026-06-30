@@ -5,7 +5,7 @@ description = "NautilusTrader × J-Quants backtest sample for Japanese stocks"
 requires-python = ">=3.12"
 dependencies = [
     "nautilus_trader>=1.228.0",
-    "jquants-api-client>=0.5.0",
+    "jquants-api-client>=2.3.0",
     "pandas>=2.0",
     "python-dotenv>=1.0",
 ]

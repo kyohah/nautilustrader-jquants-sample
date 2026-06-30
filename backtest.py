@@ -49,17 +49,14 @@ JPY = Currency.from_str("JPY")
 
 def fetch_jquants(code: str, start: str, end: str) -> pd.DataFrame:
     """J-Quants から日足 OHLCV を取得する（調整済み価格）。"""
-    refresh_token = os.getenv("JQUANTS_REFRESH_TOKEN")
-    if refresh_token:
-        client = jquantsapi.Client(refresh_token=refresh_token)
-    else:
-        client = jquantsapi.Client(
-            mail_address=os.environ["JQUANTS_MAIL_ADDRESS"],
-            password=os.environ["JQUANTS_PASSWORD"],
-        )
-
-    df = client.get_price_range(code=code, start_dt=start, end_dt=end)
-    df = df.dropna(subset=["AdjustmentClose"])
+    api_key = os.environ["JQUANTS_API_KEY"]
+    client = jquantsapi.ClientV2(api_key=api_key)
+    # V2 API: from/to は YYYYMMDD 形式
+    from_yyyymmdd = start.replace("-", "")
+    to_yyyymmdd = end.replace("-", "")
+    df = client.get_eq_bars_daily(code=code, from_yyyymmdd=from_yyyymmdd, to_yyyymmdd=to_yyyymmdd)
+    df = df.dropna(subset=["AdjC"])
+    df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
     df = df.sort_values("Date").reset_index(drop=True)
     print(f"  取得: {len(df)} 営業日 ({df['Date'].iloc[0]} 〜 {df['Date'].iloc[-1]})")
     return df
@@ -90,11 +87,11 @@ def df_to_bars(df: pd.DataFrame, instrument: Equity, bar_type: BarType) -> list[
         bars.append(
             Bar(
                 bar_type=bar_type,
-                open=instrument.make_price(float(row["AdjustmentOpen"])),
-                high=instrument.make_price(float(row["AdjustmentHigh"])),
-                low=instrument.make_price(float(row["AdjustmentLow"])),
-                close=instrument.make_price(float(row["AdjustmentClose"])),
-                volume=Quantity.from_int(int(row["AdjustmentVolume"] or 0)),
+                open=instrument.make_price(float(row["AdjO"])),
+                high=instrument.make_price(float(row["AdjH"])),
+                low=instrument.make_price(float(row["AdjL"])),
+                close=instrument.make_price(float(row["AdjC"])),
+                volume=Quantity.from_int(int(row["AdjVo"] or 0)),
                 ts_event=ts,
                 ts_init=ts,
             )
